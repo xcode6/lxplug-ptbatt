@@ -51,6 +51,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define INTERVAL 5000
 #endif
 
+#define POLL_TIMEOUT 2000
+
 /* Plug-in global data */
 
 typedef struct {
@@ -148,42 +150,92 @@ gdk_pixbuf_get_from_surface  (cairo_surface_t *surface,
 static int init_measurement (PtBattPlugin *pt)
 {
 #ifdef TEST_MODE
-    return 1;
+	return 1;
 #endif
 #ifdef __arm__
-    pt->pt_batt_avail = FALSE;
-    if (system ("systemctl status pt-device-manager | grep -wq active") == 0)
-    {
-        g_message ("pi-top device manager found");
-        pt->pt_batt_avail = TRUE;
-        pt->context = zmq_ctx_new ();
-        if (pt->context)
-        {
-            pt->requester = zmq_socket (pt->context, ZMQ_REQ);
-            if (pt->requester)
-            {
-                if (zmq_connect (pt->requester, "tcp://127.0.0.1:3782") == 0)
-                {
-                    if (zmq_send (pt->requester, "118", 3, ZMQ_NOBLOCK) == 3)
-                    {
-                        g_message ("connected to pi-top device manager");
-                        return 1;
-                    }
-                }
-            }
-        }
-        pt->requester = NULL;
-        return 0;
-    }
-#endif
-    int val;
-    if (config_setting_lookup_int (pt->settings, "BattNum", &val))
-        pt->batt = battery_get (val);
-    else
-        pt->batt = battery_get (0);
-    if (pt->batt) return 1;
+	pt->pt_batt_avail = FALSE;
+	if (system ("systemctl status pt-device-manager | grep -wq active") == 0)
+	{
+		g_message ("pi-top device manager found");
+		pt->pt_batt_avail = TRUE;
+		pt->context = zmq_ctx_new ();
+		if (pt->context)
+		{
 
-    return 0;
+			pt->requester = zmq_socket (pt->context, ZMQ_SUB);
+			if (pt->requester)
+			{
+				int lingerTime = 0;
+				int timeout = 2000;
+
+				if((zmq_setsockopt(pt->requester, ZMQ_SNDTIMEO, &timeout, sizeof(int)) == 0) &&
+				(zmq_setsockopt(pt->requester, ZMQ_RCVTIMEO, &timeout, sizeof(int)) == 0) &&
+				(zmq_setsockopt(pt->requester, ZMQ_LINGER, &lingerTime, sizeof(int)) == 0))
+				{
+					if (zmq_connect (pt->requester, "tcp://127.0.0.1:3781") == 0)
+					{
+					
+						if(zmq_setsockopt(pt->requester, ZMQ_SUBSCRIBE, "305", 3) == 0) 
+						{
+
+							g_message ("connected to pi-top device manager");
+							return 1;
+						}
+					}
+				}
+				zmq_close(pt->requester);
+			}
+		}
+		pt->requester = NULL;
+		return 0;
+	}
+#endif
+
+	int val;
+	if (config_setting_lookup_int (pt->settings, "BattNum", &val))
+		pt->batt = battery_get (val);
+	else
+		pt->batt = battery_get (0);
+	if (pt->batt) return 1;
+
+	return 0;
+}
+
+
+Bool receiveMessage(char *message, PtBattPlugin *pt)
+{
+ 
+	Bool returnValue = False;
+	zmq_msg_t zmqMessage;
+
+	int result = zmq_msg_init(&zmqMessage);
+
+	if (result == 0)
+	{
+		result = zmq_msg_recv(&zmqMessage, pt->requester, 0);
+
+		if (result == -1)
+		{
+			g_warning("Receiving error!");
+		}
+		else
+		{
+			size_t messageLength = zmq_msg_size(&zmqMessage);
+			void* pMessageData = zmq_msg_data(&zmqMessage);
+			
+			memcpy(message, pMessageData, messageLength);
+			message[messageLength] = '\0';
+			returnValue = True;
+		}
+
+		zmq_msg_close(&zmqMessage);
+	}
+	else
+	{
+    		g_warning("Creating message buffer error!");
+	}
+
+	return returnValue;
 }
 
 
@@ -330,7 +382,7 @@ static void draw_icon (PtBattPlugin *pt, int lev, float r, float g, float b, int
     g_object_ref_sink (pt->tray_icon);
     gtk_image_set_from_pixbuf (GTK_IMAGE (pt->tray_icon), pixbuf);
 
-    g_object_ref_sink (pixbuf);
+    g_object_unref (pixbuf);
     cairo_destroy (cr);
 }
 
@@ -378,6 +430,94 @@ static void update_icon (PtBattPlugin *pt)
 
     // set the tooltip
     gtk_widget_set_tooltip_text (pt->tray_icon, str);
+}
+
+void * run(void *ptx)
+{
+  usleep(1000000);
+  Bool m_continue = True;
+  PtBattPlugin *pt = (PtBattPlugin *)ptx;
+  
+  while (m_continue)
+  {
+    zmq_pollitem_t pollItems[1];
+
+    pollItems[0].socket = pt->requester;
+    pollItems[0].events = ZMQ_POLLIN;
+    int result = zmq_poll(pollItems, 1, POLL_TIMEOUT);
+
+    if (result < 0)
+    {
+      //m_continue = False;
+    }
+    else if (result == 0)
+    {
+      // No events detected (timeout)
+    }
+    else
+    {
+      char message[200];
+       
+      if (receiveMessage(message,pt))
+      {
+         int capacity, state,time, res;
+         char buffer[100];
+         float ftime;
+         char str[255];
+         if (sscanf (message, "%d|%d|%d|%d|", &res, &state, &capacity, &time) )
+            {
+                char debug[200];
+                sprintf(debug,"echo =%d=%d=%d=%d= >> /tmp/printBt",res, state, capacity, time);
+                system(debug);
+                
+                if ((state == STAT_CHARGING || state == STAT_DISCHARGING || state == STAT_EXT_POWER))
+                {
+                    // these two lines shouldn't be necessary once EXT_POWER state is implemented in the device manager
+                    if (capacity == 100 && time == 0) state = STAT_EXT_POWER;
+                    
+                    //*status = (status_t) state;
+                    //*tim = time;
+                    
+                    if (state == STAT_UNKNOWN) continue;
+                    ftime = time / 60.0;
+
+                        // fill the battery symbol and create the tooltip
+                        if (state == STAT_CHARGING)
+                        {
+                            if (time <= 0)
+                                sprintf (str, _("Charging : %d%%"), capacity);
+                            else if (time < 90)
+                                sprintf (str, _("Charging : %d%%\nTime remaining : %d minutes"), capacity, time);
+                            else
+                                sprintf (str, _("Charging : %d%%\nTime remaining : %0.1f hours"), capacity, ftime);
+                            draw_icon (pt, capacity, 0.95, 0.64, 0, 1);
+                        }
+                        else if (state == STAT_EXT_POWER)
+                        {
+                            sprintf (str, _("Charged : %d%%\nOn external power"), capacity);
+                            draw_icon (pt, capacity, 0, 0.85, 0, 2);
+                        }
+                        else
+                        {
+                            if (time <= 0)
+                                sprintf (str, _("Discharging : %d%%"), capacity);
+                            else if (time < 90)
+                                sprintf (str, _("Discharging : %d%%\nTime remaining : %d minutes"), capacity, time);
+                            else
+                                sprintf (str, _("Discharging : %d%%\nTime remaining : %0.1f hours"), capacity, ftime);
+                            if (capacity <= 20) draw_icon (pt, capacity, 1, 0, 0, 0);
+                            else draw_icon (pt, capacity, 0, 0.85, 0, 0);
+                        }
+
+                        // set the tooltip
+                        gtk_widget_set_tooltip_text (pt->tray_icon, str);
+                                        
+                }
+            }
+         
+      }
+    }
+  }
 }
 
 static gboolean timer_event (PtBattPlugin *pt)
@@ -463,7 +603,15 @@ static GtkWidget *ptbatt_constructor (LXPanel *panel, config_setting_t *settings
     if (init_measurement (pt))
     {
         /* Start timed events to monitor status */
-        pt->timer = g_timeout_add (INTERVAL, (GSourceFunc) timer_event, (gpointer) pt);
+        //pt->timer = g_timeout_add (INTERVAL, (GSourceFunc) timer_event, (gpointer) pt);
+        pthread_t ntid;
+        int err; 
+        err = pthread_create(&ntid, NULL, run,(void*)(pt));
+        pthread_detach(ntid);
+        
+        char debug[200];
+         sprintf(debug,"echo =%s= >> /tmp/printBt","init_measurement success!");
+         system(debug);
     }
     else
     {
